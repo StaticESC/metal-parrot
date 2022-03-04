@@ -9,10 +9,12 @@ use songbird::input::{
 use std::{
     io::{BufRead, BufReader, Read},
     process::Command,
-    process::{Child, Stdio},
+    process::{Child, ChildStderr, Stdio},
     time::Duration,
 };
-use tokio::{process::Command as TokioCommand, task};
+use tokio::{process::Command as TokioCommand, task, time::sleep};
+
+use super::RestartableOptions;
 
 const NEWLINE_BYTE: u8 = 0xA;
 
@@ -21,17 +23,30 @@ pub struct YouTubeRestartable {}
 impl YouTubeRestartable {
     pub async fn ytdl<P: AsRef<str> + Send + Clone + Sync + 'static>(
         uri: P,
-        lazy: bool,
+        options: RestartableOptions,
     ) -> SongbirdResult<Restartable> {
-        Restartable::new(YouTubeRestarter { uri }, lazy).await
+        if options.sponsorblock {
+            if let Ok(file_path) = ytdl_to_folder(uri.as_ref(), options.sponsorblock).await {
+                return Restartable::ffmpeg(file_path, options.lazy).await;
+            }
+        }
+
+        Restartable::new(YouTubeRestarter { uri }, options.lazy).await
     }
 
     pub async fn ytdl_search<P: AsRef<str> + Send + Clone + Sync + 'static>(
         uri: P,
-        lazy: bool,
+        options: RestartableOptions,
     ) -> SongbirdResult<Restartable> {
         let uri = format!("ytsearch1:{}", uri.as_ref());
-        Restartable::new(YouTubeRestarter { uri }, lazy).await
+
+        if options.sponsorblock {
+            if let Ok(file_path) = ytdl_to_folder(uri.as_ref(), options.sponsorblock).await {
+                return Restartable::ffmpeg(file_path, options.lazy).await;
+            }
+        }
+
+        Restartable::new(YouTubeRestarter { uri }, options.lazy).await
     }
 
     pub async fn ytdl_playlist(uri: &str, mode: Mode) -> Option<Vec<String>> {
@@ -98,31 +113,11 @@ where
     }
 }
 
-async fn ytdl(uri: &str) -> Result<(Child, Metadata), SongbirdError> {
-    let ytdl_args = [
-        "-j",            // print JSON information for video for metadata
-        "--no-simulate", // ensure video is downloaded regardless of printing
-        "-f",
-        "webm[abr>0]/bestaudio/best", // select best quality audio-only
-        "-R",
-        "infinite",        // infinite number of download retries
-        "--no-playlist",   // only download the video if URL also has playlist info
-        "--ignore-config", // disable all configuration files for a yt-dlp run
-        uri,
-        "-o",
-        "-", // stream data to stdout
-    ];
-
-    let mut yt = Command::new("yt-dlp")
-        .args(&ytdl_args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-
+async fn get_metadata_from_stream(
+    stderr: Option<ChildStderr>,
+) -> Result<(ChildStderr, Metadata), SongbirdError> {
     // track info json (for metadata) is piped to stderr by design choice of yt-dlp
     // the actual track is streamed to stdout
-    let stderr = yt.stderr.take();
     let (returned_stderr, value) = task::spawn_blocking(move || {
         let mut s = stderr.unwrap();
         let out: SongbirdResult<Value> = {
@@ -145,9 +140,88 @@ async fn ytdl(uri: &str) -> Result<(Child, Metadata), SongbirdError> {
     .map_err(|_| SongbirdError::Metadata)?;
 
     let metadata = Metadata::from_ytdl_output(value?);
+    Ok((returned_stderr, metadata))
+}
+
+async fn ytdl(uri: &str) -> Result<(Child, Metadata), SongbirdError> {
+    let ytdl_args = [
+        "-j",            // print JSON information for video for metadata
+        "--no-simulate", // ensure video is downloaded regardless of printing
+        "-f",
+        "webm[abr>0]/bestaudio/best", // select best quality audio-only
+        "-R",
+        "infinite",        // infinite number of download retries
+        "--no-playlist",   // only download the video if URL also has playlist info
+        "--ignore-config", // disable all configuration files for a yt-dlp run
+        uri,
+        "-o",
+        "-", // stream data to stdout
+    ];
+
+    let mut yt = Command::new("yt-dlp")
+        .args(&ytdl_args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let stderr = yt.stderr.take();
+    let (returned_stderr, metadata) = get_metadata_from_stream(stderr).await?;
     yt.stderr = Some(returned_stderr);
 
     Ok((yt, metadata))
+}
+
+async fn ytdl_to_folder(uri: &str, use_sponsorblock: bool) -> Result<String, SongbirdError> {
+    let mut ytdl_args = vec![
+        "-j",            // print JSON information for video for metadata
+        "--no-simulate", // ensure video is downloaded regardless of printing
+        "-f",
+        "webm[abr>0]/bestaudio/best", // select best quality audio-only
+        "-R",
+        "infinite",        // infinite number of download retries
+        "--no-playlist",   // only download the video if URL also has playlist info
+        "--ignore-config", // disable all configuration files for a yt-dlp run
+        uri,
+        "-P",
+        "temp", // download track to local /temp folder
+    ];
+
+    if use_sponsorblock {
+        ytdl_args.append(&mut vec!["--sponsorblock-remove", "all"]);
+    }
+
+    let mut yt = Command::new("yt-dlp")
+        .args(&ytdl_args)
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    // let stderr = yt.stderr.take();
+    // let (returned_stderr, metadata) = get_metadata_from_stream(stderr).await?;
+    // yt.stderr = Some(returned_stderr);
+
+    yt.wait()?; // let it download the file until the end...
+                // println!("{:?}", metadata.source_url);
+
+    let file_path =
+        "temp/Lil Nas X - MONTERO (Call Me By Your Name) (Official Video) [6swmTBVI83k].webm";
+
+    return Ok(file_path.to_string());
+
+    // let file = File::open(file_path).unwrap();
+    // let cmd = Command::new("echo").stdout(file).spawn()?;
+
+    // yt.stdout = Some(cmd.stdout.unwrap());
+
+    // let stdout = yt.stdout.take();
+
+    // let bytes = std::fs::read(file_path)?;
+    // yt.stdin.unwrap().write_all(&bytes);
+
+    // let cmd_stdin = cmd.stdin.as_mut().unwrap();
+    // cmd_stdin.write_all(f.bytes());
+
+    // return Ok((yt, metadata));
 }
 
 async fn _ytdl_metadata(uri: &str) -> SongbirdResult<Metadata> {

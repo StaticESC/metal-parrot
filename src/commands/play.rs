@@ -1,7 +1,7 @@
 use crate::{
     commands::{skip::force_skip_top_track, summon::summon},
     handlers::track_end::update_queue_messages,
-    sources::youtube::YouTubeRestartable,
+    sources::{youtube::YouTubeRestartable, RestartableOptions},
     strings::{
         PLAY_ALL_FAILED, PLAY_PLAYLIST, PLAY_QUEUE, PLAY_TOP, SEARCHING, TRACK_DURATION,
         TRACK_TIME_TO_PLAY,
@@ -286,9 +286,14 @@ async fn create_queued_embed(
 }
 
 async fn get_track_source(query: String, query_type: QueryType) -> Result<Restartable, Error> {
+    let options = RestartableOptions {
+        lazy: true,
+        sponsorblock: true,
+    };
+
     match query_type {
-        QueryType::VideoLink => YouTubeRestartable::ytdl(query, true).await,
-        QueryType::Keywords => YouTubeRestartable::ytdl_search(query, true).await,
+        QueryType::VideoLink => YouTubeRestartable::ytdl(query, options).await,
+        QueryType::Keywords => YouTubeRestartable::ytdl_search(query, options).await,
         QueryType::PlaylistLink => unreachable!(),
     }
 }
